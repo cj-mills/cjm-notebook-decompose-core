@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-notebook-decompose-core"
+dynamic = ["version"]
+description = "A Jupyter/nbdev notebook decomposition core for context graphs: a notebook IS a CodeModule whose authored source is an ordered sequence of VERBATIM cells (the lossless source substrate), composing the python decomposer (code cells -> symbols) and the markdown decomposer (markdown cells -> prose) with interleaving edges. The first step toward graph-as-source-of-truth (notebook -> graph)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    'cjm-dev-graph-schema>=0.0.5',
+    'cjm-context-graph-layer>=0.0.7',
+    'cjm-context-graph-primitives>=0.0.12',
+    'cjm-python-decompose-core>=0.0.1',
+    'cjm-markdown-decompose-core>=0.0.1',
+]
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-notebook-decompose-core"
+
+[tool.setuptools.dynamic]
+version = {attr = "cjm_notebook_decompose_core.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["cjm_notebook_decompose_core*"]

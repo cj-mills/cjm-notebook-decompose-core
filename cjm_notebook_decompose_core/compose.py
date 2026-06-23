@@ -1,0 +1,204 @@
+"""Compose a parsed notebook onto dev-graph-schema nodes (the compositor).
+
+A notebook IS a `CodeModule` whose authored source is an ordered sequence of
+verbatim `Cell`s. This module reuses the two source-type cores rather than
+reimplementing them:
+
+- code `#| export` cells -> `cjm_python_decompose_core.parse` -> `CodeSymbol`s under
+  the notebook module (DEFINES), each tagged with its source cell;
+- markdown cells -> `cjm_markdown_decompose_core.parse` (its general parse layer; the
+  memory-specific binding in that core's `extract` is deliberately NOT used) -> a
+  prose title + `[[wiki-link]]` references on the cell;
+- every cell -> a verbatim, content-hashed `Cell` node (CONTAINS + a NEXT spine);
+- the interleaving -> a markdown cell `DOCUMENTS` the symbols of the code cell it
+  precedes.
+
+Within-notebook CALLS are resolved by unambiguous bare name (precision over recall);
+cross-notebook / notebook->.py call resolution is left to a later corpus pass.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from cjm_context_graph_primitives.provenance import SourceRef
+from cjm_dev_graph_schema.nodes import CellNode, CodeModuleNode, CodeSymbolNode
+from cjm_markdown_decompose_core.parse import parse_markdown
+from cjm_python_decompose_core.parse import parse_module
+
+from .read import ParsedNotebook, parse_notebook_file
+
+
+@dataclass
+class DecomposedNotebook:
+    """A notebook bound to schema nodes: the module + verbatim cells + code symbols + edges."""
+    module: CodeModuleNode               # The notebook AS a CodeModule
+    cells: List[CellNode] = field(default_factory=list)        # Verbatim cell nodes, in order
+    symbols: List[CodeSymbolNode] = field(default_factory=list)  # Code symbols from the export cells
+    edges: List[Dict[str, Any]] = field(default_factory=list)  # CONTAINS/NEXT/DEFINES/DOCUMENTS/CALLS/REFERENCES/ABOUT
+
+
+def _md_title(parsed) -> Tuple[str, str]:
+    """(title, description) for a markdown cell: first heading (else first line) + a snippet."""
+    title = parsed.headings[0][1] if parsed.headings else ""
+    snippet = ""
+    for line in parsed.body.splitlines():
+        s = line.strip().lstrip("#").strip()
+        if s:
+            if not title:
+                title = s[:80]
+            snippet = s[:200]
+            break
+    return title, snippet
+
+
+def _cell_symbols(
+    module: CodeModuleNode,  # The notebook module
+    cell_source: str,        # The export cell's source
+    cell_key: str,           # The cell's stable key (tagged onto each symbol)
+    content_hash: str,       # The cell's content hash
+    path: str,               # The notebook path (provenance)
+) -> Tuple[List[CodeSymbolNode], List[Dict[str, Any]], List[str], List[str]]:
+    """Parse one export cell -> (symbols, DEFINES edges, this cell's top-symbol ids, imports).
+
+    Returns ([],[],[],[]) when the cell is not parseable as Python (a partial snippet
+    or a magic) — the verbatim cell is still kept by the caller."""
+    try:
+        parsed = parse_module(cell_source)
+    except SyntaxError:
+        return [], [], [], []
+    symbols: List[CodeSymbolNode] = []
+    edges: List[Dict[str, Any]] = []
+
+    def make(ps) -> CodeSymbolNode:
+        props: Dict[str, Any] = {"cell_key": cell_key}
+        if ps.decorators:
+            props["decorators"] = list(ps.decorators)
+        node = CodeSymbolNode(module_id=module.id, qualname=ps.qualname, symbol_kind=ps.kind,
+                              path=path, content_hash=content_hash, docstring=ps.docstring,
+                              calls=list(ps.calls), properties=props)
+        symbols.append(node)
+        children = [make(c) for c in ps.children]
+        if children:
+            edges.extend(node.defines_edges([c.id for c in children]))
+        return node
+
+    tops = [make(ps) for ps in parsed.symbols]
+    edges[:0] = module.defines_edges([t.id for t in tops])
+    return symbols, edges, [t.id for t in tops], list(parsed.imports)
+
+
+def decompose_notebook(
+    repo_key: str,            # The repo's durable conceptual slug (the federation anchor)
+    parsed_nb: ParsedNotebook,  # The parsed notebook
+    module_path: str,         # The notebook module's repo-relative path (export target or the .ipynb path)
+    notebook_path: str,       # The `.ipynb` file path (provenance locator)
+    nb_content_hash: str,     # Content hash over the notebook file
+    import_name: Optional[str] = None,  # Override the dotted import name
+) -> DecomposedNotebook:  # The decomposed notebook
+    """Bind a parsed notebook onto a notebook `CodeModule` + verbatim cells + symbols + edges."""
+    all_imports: List[str] = []
+    pending_symbols: List[CodeSymbolNode] = []
+    pending_edges: List[Dict[str, Any]] = []
+    cells: List[CellNode] = []
+    # tops_by_index: cell index -> its top-symbol ids (for DOCUMENTS interleaving)
+    tops_by_index: Dict[int, List[str]] = {}
+
+    # Provisional module (id is stable from repo_key+module_path); imports/docstring filled below.
+    module = CodeModuleNode(repo_key=repo_key, module_path=module_path, path=notebook_path,
+                            content_hash=nb_content_hash,
+                            import_name=import_name, docstring="")
+
+    for cell in parsed_nb.cells:
+        ch = SourceRef.compute_hash(cell.source.encode("utf-8"))
+        node = CellNode(module_id=module.id, cell_key=cell.cell_key, cell_type=cell.cell_type,
+                        source=cell.source, content_hash=ch, index=cell.index,
+                        path=notebook_path, directives=list(cell.directives))
+        if cell.cell_type == "markdown":
+            title, desc = _md_title(parse_markdown(cell.source))
+            node.title, node.description = title, desc
+            refs = parse_markdown(cell.source).wiki_links
+            if refs:
+                pending_edges.extend(node.reference_edges(refs))
+        elif cell.is_export:
+            syms, defs, tops, imps = _cell_symbols(module, cell.source, cell.cell_key, ch, notebook_path)
+            pending_symbols.extend(syms)
+            pending_edges.extend(defs)
+            tops_by_index[cell.index] = tops
+            all_imports.extend(imps)
+        cells.append(node)
+
+    # Finalize the module with the union of export-cell imports (dedup, order-preserved).
+    seen: Dict[str, None] = {}
+    for imp in all_imports:
+        seen.setdefault(imp, None)
+    module.imports = list(seen)
+
+    edges: List[Dict[str, Any]] = [module.about_edge()]
+    edges.extend(pending_edges)
+
+    # CONTAINS (module -> each cell) + the NEXT spine over cells in order.
+    for i, c in enumerate(cells):
+        edges.append(c.contains_edge())
+        if i + 1 < len(cells):
+            edges.append(c.next_edge(cells[i + 1].id))
+
+    # DOCUMENTS: a markdown cell documents the symbols defined in the cells that FOLLOW
+    # it up to the next markdown cell (the literate-programming "section" it heads) —
+    # robust to intervening setup/test cells between the prose and the def it documents.
+    for i, c in enumerate(cells):
+        if c.cell_type != "markdown":
+            continue
+        span_tops: List[str] = []
+        for nxt in cells[i + 1:]:
+            if nxt.cell_type == "markdown":
+                break
+            span_tops.extend(tops_by_index.get(nxt.index, []))
+        if span_tops:
+            edges.extend(c.documents_edges(span_tops))
+
+    # Within-notebook CALLS by unambiguous bare name (precision over recall).
+    name_to_ids: Dict[str, set] = {}
+    for s in pending_symbols:
+        name_to_ids.setdefault(s.qualname.split(".")[-1], set()).add(s.id)
+    call_map = {n: next(iter(ids)) for n, ids in name_to_ids.items() if len(ids) == 1}
+    for s in pending_symbols:
+        edges.extend(s.calls_edges(call_map))
+
+    return DecomposedNotebook(module=module, cells=cells, symbols=pending_symbols, edges=edges)
+
+
+def module_path_for_notebook(
+    notebook_path: str,          # The `.ipynb` path
+    repo_root: str,              # Repo root (for the fallback relative path)
+    default_exp: Optional[str],  # The notebook's `#| default_exp` target (or None)
+    package: Optional[str] = None,  # The importable package name (e.g. "cjm_foo")
+) -> str:  # The notebook module's repo-relative path
+    """Pick the notebook module path: the export target when known, else the `.ipynb` path.
+
+    An exporting notebook (`default_exp` + a known package) maps to its EXPORTED module
+    path (`pkg/sub/mod.py`) so the notebook and its generated `.py` share one module
+    identity (two projections of one module). A non-exporting notebook (e.g. index) keeps
+    its repo-relative `.ipynb` path as a doc-notebook container."""
+    if default_exp and package:
+        return f"{package}/" + default_exp.replace(".", "/") + ".py"
+    p = Path(notebook_path)
+    try:
+        return p.relative_to(repo_root).as_posix()
+    except ValueError:
+        return p.name
+
+
+def decompose_notebook_file(
+    repo_key: str,                  # The repo's durable conceptual slug
+    path: str,                      # Path to the `.ipynb`
+    repo_root: str,                 # Repo root (for the fallback module path)
+    package: Optional[str] = None,  # Importable package name (for export-target module paths)
+) -> DecomposedNotebook:  # The decomposed notebook
+    """Read + decompose a notebook file (module path from `default_exp`/package, else the path)."""
+    raw = Path(path).read_bytes()
+    parsed = parse_notebook_file(path)
+    module_path = module_path_for_notebook(path, repo_root, parsed.default_exp, package)
+    import_name = module_path[:-3].replace("/", ".") if module_path.endswith(".py") else None
+    return decompose_notebook(repo_key, parsed, module_path, str(path),
+                              SourceRef.compute_hash(raw), import_name=import_name)
