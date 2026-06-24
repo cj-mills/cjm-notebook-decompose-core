@@ -21,12 +21,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from cjm_context_graph_layer.grammar import make_edge
 from cjm_context_graph_primitives.provenance import SourceRef
 from cjm_dev_graph_schema.nodes import CellNode, CodeModuleNode, CodeSymbolNode
+from cjm_dev_graph_schema.vocab import DevRelations
 from cjm_markdown_decompose_core.parse import parse_markdown
-from cjm_python_decompose_core.parse import parse_module
+from cjm_python_decompose_core.parse import monkeypatch_assignments, parse_module
 
 from .read import ParsedNotebook, parse_notebook_file
+
+_METHOD_SELF = {"self", "cls"}  # first-param names that mark a method-shaped function
 
 
 @dataclass
@@ -36,6 +40,7 @@ class DecomposedNotebook:
     cells: List[CellNode] = field(default_factory=list)        # Verbatim cell nodes, in order
     symbols: List[CodeSymbolNode] = field(default_factory=list)  # Code symbols from the export cells
     edges: List[Dict[str, Any]] = field(default_factory=list)  # CONTAINS/NEXT/DEFINES/DOCUMENTS/CALLS/REFERENCES/ABOUT
+    diagnostics: Dict[str, Any] = field(default_factory=dict)  # Method re-attribution outcomes + unrecognized method-shaped fns
 
 
 def _md_title(parsed) -> Tuple[str, str]:
@@ -74,6 +79,11 @@ def _cell_symbols(
         props: Dict[str, Any] = {"cell_key": cell_key}
         if ps.decorators:
             props["decorators"] = list(ps.decorators)
+        # Stash the first-param shape (TEMP keys, popped by the re-attribution pass) so a
+        # top-level @patch/incremental method can be re-attributed to its class across cells.
+        if ps.kind == "function":
+            props["__first_param__"] = ps.first_param
+            props["__first_param_annotation__"] = ps.first_param_annotation
         node = CodeSymbolNode(module_id=module.id, qualname=ps.qualname, symbol_kind=ps.kind,
                               path=path, content_hash=content_hash, docstring=ps.docstring,
                               calls=list(ps.calls), properties=props)
@@ -86,6 +96,76 @@ def _cell_symbols(
     tops = [make(ps) for ps in parsed.symbols]
     edges[:0] = module.defines_edges([t.id for t in tops])
     return symbols, edges, [t.id for t in tops], list(parsed.imports)
+
+
+def _reattribute_methods(
+    module: CodeModuleNode,             # The notebook module
+    symbols: List[CodeSymbolNode],      # All decomposed symbols (across cells)
+    edges: List[Dict[str, Any]],        # The DEFINES/REFERENCES edges built so far
+    mp_assigns: List[Any],              # (class, attr, func) monkey-patch assignments across the notebook
+) -> Tuple[List[CodeSymbolNode], List[Dict[str, Any]], Dict[str, str], Dict[str, Any]]:
+    """Rebuild the TRUE class->method structure for cross-cell method-splitting idioms.
+
+    nbdev libs split a class across cells to dodge whole-cell rewrites, via `@patch`
+    (`def get(self: Store)`) or incremental assignment (`Store.get = get`). The AST walk
+    sees those as FREE FUNCTIONS, so the class looks empty. This pass re-keys each such
+    function to its real `Class.method` identity (kind=method), converts the module->fn
+    DEFINES into class->method DEFINES, and remaps every edge referencing it. The verbatim
+    cells are untouched (round-trip/authoring preserved) — only the symbol overlay is fixed.
+
+    Returns (new_symbols, new_edges, id_remap, diagnostics). Diagnostics surface the
+    re-attributions AND method-shaped (`self`/`cls` first param) functions it could NOT
+    attribute — the lookout for OTHER cross-cell scars beyond these two."""
+    class_by_name = {s.qualname: s for s in symbols
+                     if s.symbol_kind == "class" and "." not in s.qualname}
+    mp = {}  # func name -> (class, attr); first assignment wins
+    for cls, attr, func in mp_assigns:
+        mp.setdefault(func, (cls, attr))
+
+    id_remap: Dict[str, str] = {}
+    owner_of: Dict[str, str] = {}  # new method id -> owning class id (to fix DEFINES source)
+    new_symbols: List[CodeSymbolNode] = []
+    reattributed: List[Dict[str, str]] = []
+    unrecognized: List[Dict[str, Any]] = []
+
+    for s in symbols:
+        fp = s.properties.pop("__first_param__", "")
+        fpa = s.properties.pop("__first_param_annotation__", "")
+        if not (s.symbol_kind == "function" and "." not in s.qualname):
+            new_symbols.append(s)
+            continue
+        decos = s.properties.get("decorators", [])
+        owner = method = pattern = None
+        if "patch" in decos and fpa in class_by_name:       # Pattern A: @patch + self:Class
+            owner, method, pattern = class_by_name[fpa], s.qualname, "patch"
+        elif s.qualname in mp and mp[s.qualname][0] in class_by_name:  # Pattern B: Class.m = fn
+            cls, attr = mp[s.qualname]
+            owner, method, pattern = class_by_name[cls], attr, "assign"
+        if owner is not None:
+            new = CodeSymbolNode(module_id=module.id, qualname=f"{owner.qualname}.{method}",
+                                 symbol_kind="method", path=s.path, content_hash=s.content_hash,
+                                 docstring=s.docstring, calls=list(s.calls),
+                                 properties=dict(s.properties))
+            id_remap[s.id] = new.id
+            owner_of[new.id] = owner.id
+            reattributed.append({"from": s.qualname, "to": new.qualname, "pattern": pattern})
+            new_symbols.append(new)
+        else:
+            if fp in _METHOD_SELF:  # method-shaped but unattributed -> a possible OTHER scar
+                unrecognized.append({"qualname": s.qualname, "cell_key": s.properties.get("cell_key")})
+            new_symbols.append(s)
+
+    if not id_remap:
+        return symbols, edges, {}, {"reattributed": [], "unrecognized": unrecognized}
+
+    new_edges: List[Dict[str, Any]] = []
+    for e in edges:
+        src, tgt, rel = e["source_id"], e["target_id"], e["relation_type"]
+        ns, nt = id_remap.get(src, src), id_remap.get(tgt, tgt)
+        if rel == DevRelations.DEFINES and src == module.id and tgt in id_remap:
+            ns = owner_of[id_remap[tgt]]  # module->fn becomes owning class->method
+        new_edges.append(make_edge(ns, nt, rel))
+    return new_symbols, new_edges, id_remap, {"reattributed": reattributed, "unrecognized": unrecognized}
 
 
 def decompose_notebook(
@@ -101,6 +181,7 @@ def decompose_notebook(
     pending_symbols: List[CodeSymbolNode] = []
     pending_edges: List[Dict[str, Any]] = []
     cells: List[CellNode] = []
+    mp_assigns: List[Any] = []  # cross-cell `Class.method = fn` incremental-class assignments
     # tops_by_index: cell index -> its top-symbol ids (for DOCUMENTS interleaving)
     tops_by_index: Dict[int, List[str]] = {}
 
@@ -126,6 +207,7 @@ def decompose_notebook(
             pending_edges.extend(defs)
             tops_by_index[cell.index] = tops
             all_imports.extend(imps)
+            mp_assigns.extend(monkeypatch_assignments(cell.source))
         cells.append(node)
 
     # Finalize the module with the union of export-cell imports (dedup, order-preserved).
@@ -133,6 +215,13 @@ def decompose_notebook(
     for imp in all_imports:
         seen.setdefault(imp, None)
     module.imports = list(seen)
+
+    # Re-attribute cross-cell @patch / incremental methods to their TRUE class (before the
+    # DOCUMENTS/CALLS passes, which key off symbol ids); remap the DOCUMENTS source ids.
+    pending_symbols, pending_edges, id_remap, diagnostics = _reattribute_methods(
+        module, pending_symbols, pending_edges, mp_assigns)
+    if id_remap:
+        tops_by_index = {i: [id_remap.get(t, t) for t in tops] for i, tops in tops_by_index.items()}
 
     edges: List[Dict[str, Any]] = [module.about_edge()]
     edges.extend(pending_edges)
@@ -165,7 +254,8 @@ def decompose_notebook(
     for s in pending_symbols:
         edges.extend(s.calls_edges(call_map))
 
-    return DecomposedNotebook(module=module, cells=cells, symbols=pending_symbols, edges=edges)
+    return DecomposedNotebook(module=module, cells=cells, symbols=pending_symbols, edges=edges,
+                              diagnostics=diagnostics)
 
 
 def module_path_for_notebook(
