@@ -86,7 +86,7 @@ def _cell_symbols(
             props["__first_param_annotation__"] = ps.first_param_annotation
         node = CodeSymbolNode(module_id=module.id, qualname=ps.qualname, symbol_kind=ps.kind,
                               path=path, content_hash=content_hash, docstring=ps.docstring,
-                              calls=list(ps.calls), properties=props)
+                              calls=list(ps.calls), refs=list(ps.refs), properties=props)
         symbols.append(node)
         children = [make(c) for c in ps.children]
         if children:
@@ -144,7 +144,7 @@ def _reattribute_methods(
         if owner is not None:
             new = CodeSymbolNode(module_id=module.id, qualname=f"{owner.qualname}.{method}",
                                  symbol_kind="method", path=s.path, content_hash=s.content_hash,
-                                 docstring=s.docstring, calls=list(s.calls),
+                                 docstring=s.docstring, calls=list(s.calls), refs=list(s.refs),
                                  properties=dict(s.properties))
             id_remap[s.id] = new.id
             owner_of[new.id] = owner.id
@@ -246,13 +246,14 @@ def decompose_notebook(
         if span_tops:
             edges.extend(c.documents_edges(span_tops))
 
-    # Within-notebook CALLS by unambiguous bare name (precision over recall).
+    # Within-notebook CALLS + USES by unambiguous bare name (precision over recall).
     name_to_ids: Dict[str, set] = {}
     for s in pending_symbols:
         name_to_ids.setdefault(s.qualname.split(".")[-1], set()).add(s.id)
     call_map = {n: next(iter(ids)) for n, ids in name_to_ids.items() if len(ids) == 1}
     for s in pending_symbols:
         edges.extend(s.calls_edges(call_map))
+        edges.extend(s.uses_edges(call_map))
 
     return DecomposedNotebook(module=module, cells=cells, symbols=pending_symbols, edges=edges,
                               diagnostics=diagnostics)
