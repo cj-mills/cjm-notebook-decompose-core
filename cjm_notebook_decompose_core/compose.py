@@ -28,7 +28,7 @@ from cjm_dev_graph_schema.vocab import DevRelations
 from cjm_markdown_decompose_core.parse import parse_markdown
 from cjm_python_decompose_core.parse import monkeypatch_assignments, parse_module
 
-from .read import ParsedNotebook, parse_notebook_file
+from .read import parse_notebook_file, ParsedNotebook
 
 _METHOD_SELF = {"self", "cls"}  # first-param names that mark a method-shaped function
 
