@@ -129,3 +129,28 @@ def test_non_python_export_cell_keeps_verbatim_cell():
     parsed = parse_notebook(json.dumps({"cells": cells, "nbformat": 4, "nbformat_minor": 5}))
     d = decompose_notebook("cjm-foo", parsed, "cjm_foo/core.py", "/x.ipynb", "sha256:nb")
     assert len(d.cells) == 2 and d.symbols == []  # no symbols, but verbatim cells survive
+
+
+def test_non_export_code_cells_harvest_call_names():
+    """A non-export code cell (nbdev's test/example vehicle) gets its bare call names
+    stashed on the CellNode — the TESTS-edge substrate; export/markdown cells do not."""
+    import json
+
+    from cjm_notebook_decompose_core.compose import decompose_notebook
+    from cjm_notebook_decompose_core.read import parse_notebook
+
+    nb = json.dumps({"cells": [
+        {"cell_type": "code", "id": "c0", "source": "#| default_exp core\n"},
+        {"cell_type": "code", "id": "c1",
+         "source": "#| export\ndef alpha(x):\n    return x + 1\n"},
+        {"cell_type": "code", "id": "c2", "source": "assert alpha(1) == 2\nprint(alpha(3))\n"},
+        {"cell_type": "code", "id": "c3", "source": "%magic  # unparseable\n(\n"},
+        {"cell_type": "markdown", "id": "c4", "source": "# alpha() prose\n"},
+    ], "metadata": {}, "nbformat": 4, "nbformat_minor": 5})
+    parsed = parse_notebook(nb)
+    dn = decompose_notebook("demo", parsed, "demo/core.py", "/tmp/nb.ipynb", "h")
+    by_key = {c.cell_key: c for c in dn.cells}
+    assert sorted(by_key["c2"].calls) == ["alpha", "print"]  # dedup (walk order, not source order)
+    assert by_key["c3"].calls == []                   # unparseable -> no harvest
+    assert by_key["c1"].calls == [] and by_key["c4"].calls == []
+    assert sorted(by_key["c2"].to_graph_node()["properties"]["calls"]) == ["alpha", "print"]

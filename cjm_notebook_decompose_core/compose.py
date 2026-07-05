@@ -17,6 +17,7 @@ Within-notebook CALLS are resolved by unambiguous bare name (precision over reca
 cross-notebook / notebook->.py call resolution is left to a later corpus pass.
 """
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -55,6 +56,25 @@ def _md_title(parsed) -> Tuple[str, str]:
             snippet = s[:200]
             break
     return title, snippet
+
+
+def _cell_call_names(
+    source: str,  # A non-export code cell's source
+) -> List[str]:  # Bare names the cell calls (dedup, order-preserved; [] when unparseable)
+    """Collect the bare function/class names a cell CALLS (`alpha(...)`, `Store(...)`).
+
+    The TESTS-edge substrate: a non-export code cell is nbdev's test/example vehicle,
+    so the names it calls are the symbols it exercises. Name-func calls only —
+    precision over recall (attribute calls are instance-bound, not symbol refs)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []  # magics / partial snippets — no call harvest
+    seen: Dict[str, None] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            seen.setdefault(n.func.id, None)
+    return list(seen)
 
 
 def _cell_symbols(
@@ -209,6 +229,10 @@ def decompose_notebook(
             tops_by_index[cell.index] = tops
             all_imports.extend(imps)
             mp_assigns.extend(monkeypatch_assignments(cell.source))
+        elif cell.cell_type == "code":
+            # A non-export code cell is the nbdev test/example vehicle — harvest the
+            # names it calls (the corpus TESTS pass resolves them to symbols).
+            node.calls = _cell_call_names(cell.source)
         cells.append(node)
 
     # Finalize the module with the union of export-cell imports (dedup, order-preserved).
