@@ -37,6 +37,7 @@ _METHOD_SELF = {"self", "cls"}  # first-param names that mark a method-shaped fu
 @dataclass
 class DecomposedNotebook:
     """A notebook bound to schema nodes: the module + verbatim cells + code symbols + edges."""
+
     module: CodeModuleNode               # The notebook AS a CodeModule
     cells: List[CellNode] = field(default_factory=list)        # Verbatim cell nodes, in order
     symbols: List[CodeSymbolNode] = field(default_factory=list)  # Code symbols from the export cells

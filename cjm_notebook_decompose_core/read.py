@@ -23,6 +23,7 @@ _EXPORT_DIRECTIVES = {"export", "exporti", "exports"}
 @dataclass
 class ParsedCell:
     """One notebook cell, parsed but not yet schema-bound."""
+
     cell_type: str                  # "code" | "markdown" | "raw"
     source: str                     # Verbatim cell source (lossless)
     index: int                      # Positional index in the notebook
@@ -39,6 +40,7 @@ class ParsedCell:
 @dataclass
 class ParsedNotebook:
     """The structural decomposition of one notebook."""
+
     cells: List[ParsedCell] = field(default_factory=list)  # Cells in document order
     default_exp: Optional[str] = None  # The `#| default_exp` module target (e.g. "core"), if any
 
