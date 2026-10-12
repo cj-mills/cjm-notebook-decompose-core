@@ -3,11 +3,9 @@
 import json
 
 import pytest
-
 from cjm_dev_graph_schema.identity import code_module_node_id, entity_node_id
 from cjm_dev_graph_schema.vocab import DevNodeKinds, DevRelations
-
-from cjm_notebook_decompose_core.compose import (decompose_notebook, module_path_for_notebook)
+from cjm_notebook_decompose_core.compose import decompose_notebook, module_path_for_notebook
 from cjm_notebook_decompose_core.ingest import notebook_graph_elements
 from cjm_notebook_decompose_core.read import parse_notebook
 

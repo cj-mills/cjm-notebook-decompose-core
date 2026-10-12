@@ -14,6 +14,7 @@ Run in the core env with the substrate runtime + the new libs installed -e:
     conda run -n cjm-transcript-correction-core --no-capture-output python \
         cjm-notebook-decompose-core/tests_manual/real_notebook.py
 """
+
 import argparse
 import asyncio
 import json
@@ -24,7 +25,6 @@ from pathlib import Path
 
 from cjm_context_graph_layer.ops import extend_graph
 from cjm_dev_graph_schema.vocab import DevNodeKinds, DevRelations
-
 from cjm_notebook_decompose_core.compose import decompose_notebook_file
 from cjm_notebook_decompose_core.ingest import notebook_graph_elements
 from cjm_notebook_decompose_core.read import parse_notebook, parse_notebook_file
